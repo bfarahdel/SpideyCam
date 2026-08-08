@@ -1,0 +1,990 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕸️</text></svg>"
+    />
+    <title>SpideyCam</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: #0a0a0f;
+        color: #e8e8f0;
+        font-family:
+          "SF Pro Text",
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          Roboto,
+          sans-serif;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        gap: 12px;
+        overflow: hidden;
+        /* Prevent overscroll bounce on mobile */
+        overscroll-behavior: none;
+        -webkit-user-select: none;
+        user-select: none;
+        touch-action: none;
+      }
+      #stage {
+        position: relative;
+        width: 100%;
+        max-width: 960px;
+        aspect-ratio: 4 / 3;
+        border-radius: 14px;
+        overflow: hidden;
+        background: #111;
+        box-shadow: 0 0 40px rgba(75, 63, 227, 0.15);
+      }
+      #cam {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        transform: scaleX(
+          -1
+        ); /* selfie mirror — disabled on mobile via class */
+      }
+      #cam.no-mirror {
+        transform: none;
+      }
+      #fx {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+
+      /* Mobile: full-screen, no card, no gaps */
+      @media (max-width: 768px) and (pointer: coarse) {
+        body {
+          gap: 6px;
+          padding: 0;
+        }
+        #stage {
+          max-width: none;
+          width: 100vw;
+          height: 100vh;
+          aspect-ratio: auto;
+          border-radius: 0;
+          box-shadow: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <video id="cam" autoplay playsinline muted></video>
+      <canvas id="fx"></canvas>
+    </div>
+
+    <script type="module">
+      import {
+        HandLandmarker,
+        FilesetResolver,
+      } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs";
+
+      // ─── Device detection ─────────────────────────────────────
+      const IS_MOBILE =
+        matchMedia("(pointer: coarse)").matches ||
+        /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+      const FACING_MODE = IS_MOBILE ? "environment" : "user"; // rear on mobile, front on desktop
+      const DO_MIRROR = IS_MOBILE ? false : true; // mirror only for front camera
+
+      // ─── Config ───────────────────────────────────────────────
+      const TARGET_GESTURE = "11001"; // [thumb, index, middle, ring, pinky]
+      const STREAK_REQUIRED = 3; // consecutive frames to confirm
+      const SHOT_SPEED = IS_MOBILE ? 14 : 18; // px per frame — slower on mobile
+      const TRAIL_MAX = IS_MOBILE ? 14 : 22; // fewer trail points on mobile
+      const SHOT_MAX_AGE = 70; // frames before a shot fades
+      const FADE_RATE = 0.04; // alpha decay when fading
+      const SPLAT_STRANDS = IS_MOBILE ? 8 : 10; // fewer strands on mobile
+      const SPLAT_MAX_R = IS_MOBILE ? 25 : 32; // smaller splat on mobile
+
+      // Contrast-anchor edge detection
+      const MAX_SHOT_DIST = 520; // fallback max travel distance
+      const EDGE_THRESHOLD = 40; // brightness jump to count as edge
+      const SAMPLE_STEP = IS_MOBILE ? 7 : 5; // coarser sampling on mobile
+      const STUCK_MAX_AGE = 360; // frames a stuck web lingers (~6s @ 60fps)
+
+      // Spider web net pattern (appears when stuck)
+      const NET_SPOKES = IS_MOBILE ? 8 : 10; // fewer spokes on mobile
+      const NET_RINGS = IS_MOBILE ? 4 : 5; // fewer rings on mobile
+      const NET_MAX_R = IS_MOBILE ? 125 : 160; // smaller net on mobile
+      const NET_GROW_SPEED = 0.025; // growth per frame (1 = full size)
+
+      // Camera resolution — lower on mobile for performance
+      const CAM_WIDTH = IS_MOBILE ? 640 : 1280;
+      const CAM_HEIGHT = IS_MOBILE ? 480 : 720;
+
+      // ─── Optical flow (Lucas-Kanade) for stuck web tracking ──
+      const OF_WINDOW = IS_MOBILE ? 9 : 12; // half-window for LK patch
+      const OF_FULL_WIN = OF_WINDOW * 2 + 1; // full patch size (19² mobile, 25² desktop)
+      const OF_MAX_TRACKED = IS_MOBILE ? 3 : 4; // Tier 1: full LK per-frame
+      const OF_TIER2_MAX = IS_MOBILE ? 4 : 5; // Tier 2: shared global motion
+      const OF_CONF_THRESH = 0.01; // below this → frame counts as low-confidence
+      const OF_LOST_GRACE = 15; // consecutive low-conf frames before a *tracked* web fades
+
+      // ─── Web erasure by waving ───────────────────────────────
+      const ERASE_VEL_MULT = 0.35; // palm-widths per frame to trigger erase
+      const DISPERSE_FADE = 0.08; // fade rate for dispersed webs (~0.2s at 60fps)
+      const DISPERSE_BURST = 0.6; // net expands by this fraction as it disperses
+
+      // ─── DOM ──────────────────────────────────────────────────
+      const video = document.getElementById("cam");
+      // Disable CSS mirroring on mobile (rear camera shows true orientation)
+      if (!DO_MIRROR) video.classList.add("no-mirror");
+      const stage = document.getElementById("stage");
+      const canvas = document.getElementById("fx");
+      const ctx = canvas.getContext("2d");
+
+      // Offscreen canvas for reading raw video pixels (contrast anchor)
+      const offCanvas = document.createElement("canvas");
+      const offCtx = offCanvas.getContext("2d", { willReadFrequently: true });
+
+      // Separate small canvas for LK patch extraction (avoids resizing offCanvas)
+      const patchCanvas = document.createElement("canvas");
+      const patchCtx = patchCanvas.getContext("2d", {
+        willReadFrequently: true,
+      });
+
+      // ─── State ────────────────────────────────────────────────
+      let handLandmarker = null;
+      let lastVideoTime = -1;
+      const WEBS = [];
+
+      // Per-hand state — keyed by handedness label ("Left"/"Right")
+      // Falls back to index if handedness is missing
+      const handState = {}; // { "Left": {streak, active, hasFired}, "Right": {...} }
+
+      function getHandState(handedness, fallbackKey) {
+        const key = handedness || fallbackKey;
+        if (!handState[key]) {
+          handState[key] = {
+            streak: 0,
+            active: false,
+            hasFired: false,
+            prevPalmX: null,
+            prevPalmY: null,
+          };
+        }
+        return handState[key];
+      }
+
+      // Reset hands not seen this frame so they can fire again when re-detected
+      function resetStaleHands(seenKeys) {
+        for (const key of Object.keys(handState)) {
+          if (!seenKeys.has(key)) {
+            handState[key].streak = 0;
+            handState[key].active = false;
+            handState[key].hasFired = false;
+            handState[key].prevPalmX = null;
+            handState[key].prevPalmY = null;
+          }
+        }
+      }
+
+      // ─── Gesture detection ────────────────────────────────────
+      // Uses distance-from-wrist test (orientation-independent)
+      function fingerStates(lm) {
+        const d = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+        const wrist = lm[0];
+        const palm = d(lm[0], lm[9]); // wrist → middle MCP (size reference)
+        const dead = palm * 0.08; // flicker dead-zone
+
+        const ext = (tip, pip) =>
+          d(lm[tip], wrist) - d(lm[pip], wrist) > dead ? 1 : 0;
+
+        // Thumb: horizontal spread from index knuckle
+        const thumb =
+          Math.abs(lm[4].x - lm[5].x) - Math.abs(lm[3].x - lm[5].x) > dead
+            ? 1
+            : 0;
+
+        return [thumb, ext(8, 6), ext(12, 10), ext(16, 14), ext(20, 18)];
+      }
+
+      // ─── Cover-crop: align overlay with the visible (object-fit: cover) video ──
+      // The <video> uses object-fit: cover, so it crops the full frame to fill the
+      // stage. The canvas must represent that same cropped region, otherwise the
+      // skeleton/webs drift from the visible hand. Recomputed on init + resize.
+      let cropX0 = 0,
+        cropY0 = 0,
+        cropW = 1,
+        cropH = 1; // normalized region of the full frame that is visible
+      function recomputeCrop() {
+        const vw = video.videoWidth || 1;
+        const vh = video.videoHeight || 1;
+        const rect = stage.getBoundingClientRect();
+        const dispAspect =
+          rect.width > 0 && rect.height > 0
+            ? rect.width / rect.height
+            : vw / vh;
+        const vidAspect = vw / vh;
+        if (vidAspect > dispAspect) {
+          // video wider than stage → horizontal crop
+          cropW = dispAspect / vidAspect;
+          cropH = 1;
+          cropX0 = (1 - cropW) / 2;
+          cropY0 = 0;
+        } else {
+          // video taller than stage → vertical crop
+          cropW = 1;
+          cropH = vidAspect / dispAspect;
+          cropX0 = 0;
+          cropY0 = (1 - cropH) / 2;
+        }
+        canvas.width = Math.max(1, Math.round(vw * cropW));
+        canvas.height = Math.max(1, Math.round(vh * cropH));
+      }
+      window.addEventListener("resize", recomputeCrop);
+      window.addEventListener("orientationchange", recomputeCrop);
+
+      // ─── Landmark → pixel (conditional mirror for selfie view) ──
+      function toPx(lm) {
+        const nx = (lm.x - cropX0) / cropW;
+        const ny = (lm.y - cropY0) / cropH;
+        const x = DO_MIRROR ? (1 - nx) * canvas.width : nx * canvas.width;
+        return { x, y: ny * canvas.height };
+      }
+
+      // Convert raw video pixels → canvas coords (applies cover-crop + mirror)
+      function videoPxToCanvas(px, py) {
+        const nx = (px / video.videoWidth - cropX0) / cropW;
+        const ny = (py / video.videoHeight - cropY0) / cropH;
+        const x = DO_MIRROR ? (1 - nx) * canvas.width : nx * canvas.width;
+        return { x, y: ny * canvas.height };
+      }
+
+      // ─── Web projectile lifecycle ─────────────────────────────
+      function createWebShot(originPx, anchorPx) {
+        const dx = anchorPx.x - originPx.x;
+        const dy = anchorPx.y - originPx.y;
+        const dist = Math.hypot(dx, dy) || 1;
+
+        // Per-shot random web geometry — baked once, stable every frame
+        const numSpokes = NET_SPOKES + (Math.random() < 0.5 ? -1 : 1);
+        const spokes = [];
+        let angleCursor = Math.random() * 0.6;
+        const baseAngleStep = (Math.PI * 2) / numSpokes;
+        for (let i = 0; i < numSpokes; i++) {
+          // irregular angular spacing
+          angleCursor += baseAngleStep * (0.7 + Math.random() * 0.6);
+          spokes.push({
+            angle: angleCursor,
+            lengthMul: 0.65 + Math.random() * 0.5, // 0.65–1.15 — uneven reach
+            wobble: Math.random() * Math.PI * 2, // phase offset for waviness
+            wobbleAmp: 3 + Math.random() * 8, // how much the strand bows
+          });
+        }
+
+        // Per-ring random radii multipliers
+        const rings = [];
+        for (let i = 0; i < NET_RINGS; i++) {
+          rings.push({
+            radiusMul:
+              0.15 + (i / NET_RINGS) * 0.85 * (0.85 + Math.random() * 0.3),
+            wobblePhase: Math.random() * Math.PI * 2,
+          });
+        }
+
+        // Distance-based sizing: farther shots produce larger webs
+        const t = Math.max(0, Math.min(1, (dist - 50) / (MAX_SHOT_DIST - 50)));
+        const sizeScale = 0.5 + t * 1.0; // 0.5× at close range → 1.5× at max range
+
+        return {
+          x: originPx.x,
+          y: originPx.y,
+          targetX: anchorPx.x,
+          targetY: anchorPx.y,
+          vx: (dx / dist) * SHOT_SPEED,
+          vy: (dy / dist) * SHOT_SPEED,
+          trail: [],
+          age: 0,
+          fadeAlpha: 1,
+          state: "flying", // flying → stuck → fading
+          stuck: false,
+          splatR: 4,
+          netMaxR: NET_MAX_R * sizeScale, // per-web radius (distance-scaled)
+          splatMaxR: SPLAT_MAX_R * sizeScale, // per-web splat size
+          netGrowth: 0, // 0→1 web net expands when stuck
+          spokes, // per-shot randomized spoke geometry
+          rings, // per-shot randomized ring radii
+          // Optical flow tracking (populated when web sticks)
+          needsPatch: false, // set true on stick → triggers patch capture
+          patch: null, // grayscale patch from current frame
+          prevPatch: null, // grayscale patch from previous frame
+          trackConfidence: 1, // LK tracking quality (0 = lost)
+          hadTrack: false, // true once a frame was confidently tracked
+          lostStreak: 0, // consecutive low-confidence frames since last good track
+          disperseT: 0, // 0→1 burst progress when dispersed by waving
+        };
+      }
+
+      // ─── Contrast anchor: find first strong edge along the aim ray ──
+      function findContrastAnchor(lm) {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        offCanvas.width = vw;
+        offCanvas.height = vh;
+        offCtx.drawImage(video, 0, 0, vw, vh);
+        const imgData = offCtx.getImageData(0, 0, vw, vh).data;
+
+        // raw pixel start = index fingertip
+        const sx = Math.round(lm[8].x * vw);
+        const sy = Math.round(lm[8].y * vh);
+
+        // raw direction = wrist → index fingertip in pixel space
+        const wx = lm[0].x * vw;
+        const wy = lm[0].y * vh;
+        const rdx = sx - wx;
+        const rdy = sy - wy;
+        const rlen = Math.hypot(rdx, rdy) || 1;
+        const dirX = rdx / rlen;
+        const dirY = rdy / rlen;
+
+        let prevBright = null;
+        for (let d = 15; d < MAX_SHOT_DIST; d += SAMPLE_STEP) {
+          const px = Math.round(sx + dirX * d);
+          const py = Math.round(sy + dirY * d);
+          if (px < 0 || px >= vw || py < 0 || py >= vh) break;
+
+          const idx = (py * vw + px) * 4;
+          const bright =
+            (imgData[idx] + imgData[idx + 1] + imgData[idx + 2]) / 3;
+
+          if (
+            prevBright !== null &&
+            Math.abs(bright - prevBright) > EDGE_THRESHOLD
+          ) {
+            // convert raw pixel → canvas coords (cover-crop + mirror)
+            return videoPxToCanvas(px, py);
+          }
+          prevBright = bright;
+        }
+        // fallback: fixed distance
+        const fx = Math.round(sx + dirX * MAX_SHOT_DIST);
+        const fy = Math.round(sy + dirY * MAX_SHOT_DIST);
+        const clampedX = Math.max(0, Math.min(vw, fx));
+        const clampedY = Math.max(0, Math.min(vh, fy));
+        return videoPxToCanvas(clampedX, clampedY);
+      }
+
+      // ─── Optical flow: Lucas-Kanade sparse point tracking ────
+      // Dynamic lifespan: more stuck webs → shorter linger (Option C)
+      function dynamicStuckMaxAge(stuckCount) {
+        if (stuckCount <= 3) return 360; // ~6s @ 60fps
+        if (stuckCount <= 6) return 240; // ~4s
+        return 120; // ~2s
+      }
+
+      let currentStuckMaxAge = STUCK_MAX_AGE; // updated each frame by updateOpticalFlow
+
+      // Convert canvas-space coordinates → raw video pixel coordinates
+      // (inverts the cover-crop + mirror applied by toPx/videoPxToCanvas)
+      function canvasToVideo(cx, cy) {
+        const nx = DO_MIRROR ? 1 - cx / canvas.width : cx / canvas.width;
+        const ny = cy / canvas.height;
+        return {
+          x: (cropX0 + nx * cropW) * video.videoWidth,
+          y: (cropY0 + ny * cropH) * video.videoHeight,
+        };
+      }
+
+      // Extract a grayscale patch from the video centered at video-pixel (vx, vy)
+      function extractPatch(vx, vy) {
+        const half = OF_WINDOW;
+        const w = OF_FULL_WIN;
+        patchCanvas.width = w;
+        patchCanvas.height = w;
+        const cx = Math.max(half, Math.min(video.videoWidth - half, vx));
+        const cy = Math.max(half, Math.min(video.videoHeight - half, vy));
+        patchCtx.drawImage(video, cx - half, cy - half, w, w, 0, 0, w, w);
+        const data = patchCtx.getImageData(0, 0, w, w).data;
+        const patch = new Float32Array(w * w);
+        for (let i = 0; i < w * w; i++) {
+          patch[i] = (data[i * 4] + data[i * 4 + 1] + data[i * 4 + 2]) / 3;
+        }
+        return patch;
+      }
+
+      // Lucas-Kanade: estimate (dx, dy) displacement between prevPatch and currPatch
+      function lucasKanade(prevPatch, currPatch) {
+        const w = OF_FULL_WIN;
+        let sIx2 = 0,
+          sIy2 = 0,
+          sIxIy = 0,
+          sIxIt = 0,
+          sIyIt = 0;
+
+        for (let y = 0; y < w - 1; y++) {
+          for (let x = 0; x < w - 1; x++) {
+            const i = y * w + x;
+            const Ix = currPatch[i + 1] - currPatch[i];
+            const Iy = currPatch[i + w] - currPatch[i];
+            const It = currPatch[i] - prevPatch[i];
+            sIx2 += Ix * Ix;
+            sIy2 += Iy * Iy;
+            sIxIy += Ix * Iy;
+            sIxIt += Ix * It;
+            sIyIt += Iy * It;
+          }
+        }
+
+        const det = sIx2 * sIy2 - sIxIy * sIxIy;
+        if (Math.abs(det) < 1e-4) return { dx: 0, dy: 0, confidence: 0 };
+
+        const dx = (sIy2 * -sIxIt - sIxIy * -sIyIt) / det;
+        const dy = (sIxIy * -sIxIt - sIx2 * -sIyIt) / det;
+
+        // Confidence: min eigenvalue of A^T A, normalized by window area
+        const trace = sIx2 + sIy2;
+        const minEig = (trace - Math.sqrt(trace * trace - 4 * det)) / 2;
+        const confidence = Math.min(1, minEig / (w * w * 10));
+
+        return { dx, dy, confidence };
+      }
+
+      // Tiered optical flow update — called once per frame for all stuck webs
+      function updateOpticalFlow() {
+        const stuckWebs = WEBS.filter((s) => s.state === "stuck");
+        if (stuckWebs.length === 0) {
+          currentStuckMaxAge = STUCK_MAX_AGE;
+          return;
+        }
+
+        // Dynamic lifespan (Option C)
+        currentStuckMaxAge = dynamicStuckMaxAge(stuckWebs.length);
+
+        // Sort oldest → youngest (Tier 1 = youngest at the end)
+        stuckWebs.sort((a, b) => a.age - b.age);
+        const n = stuckWebs.length;
+
+        // Tier 1: newest N webs — full Lucas-Kanade
+        const t1Count = Math.min(OF_MAX_TRACKED, n);
+        const tier1 = stuckWebs.slice(n - t1Count);
+
+        // Tier 2: next N — shared global motion
+        const t2Count = Math.min(OF_TIER2_MAX, n - t1Count);
+        const tier2 =
+          t2Count > 0
+            ? stuckWebs.slice(n - t1Count - t2Count, n - t1Count)
+            : [];
+
+        let avgDx = 0,
+          avgDy = 0,
+          tracked = 0;
+
+        for (const web of tier1) {
+          // Capture initial patch on first tracking frame.
+          // Skip LK this frame: a single patch yields no displacement, and
+          // comparing it to itself would report zero texture-relative motion.
+          if (web.needsPatch) {
+            const vp = canvasToVideo(web.x, web.y);
+            web.patch = extractPatch(vp.x, vp.y);
+            web.prevPatch = web.patch;
+            web.needsPatch = false;
+            continue;
+          }
+
+          const vp = canvasToVideo(web.x, web.y);
+          const currPatch = extractPatch(vp.x, vp.y);
+          const result = lucasKanade(web.prevPatch, currPatch);
+
+          if (result.confidence > OF_CONF_THRESH) {
+            // Convert video-space displacement → canvas-space (flip dx if mirrored)
+            const cdx = DO_MIRROR ? -result.dx : result.dx;
+            const cdy = result.dy;
+            web.x += cdx;
+            web.y += cdy;
+            web.prevPatch = currPatch;
+            web.trackConfidence = result.confidence;
+            web.hadTrack = true;
+            web.lostStreak = 0;
+            avgDx += cdx;
+            avgDy += cdy;
+            tracked++;
+          } else {
+            // Low confidence: freeze the web (no position update). Only fade if
+            // we previously had tracking and it stays lost past the grace period
+            // — a textureless surface (hadTrack=false) just stays put and lets
+            // the age-based expiry handle it, so webs on blank walls still linger.
+            web.trackConfidence = 0;
+            web.lostStreak++;
+            if (web.hadTrack && web.lostStreak > OF_LOST_GRACE) {
+              web.state = "fading";
+            }
+          }
+        }
+
+        // Tier 2: apply average Tier 1 displacement (one calc, many webs)
+        if (tracked > 0) {
+          avgDx /= tracked;
+          avgDy /= tracked;
+          for (const web of tier2) {
+            web.x += avgDx;
+            web.y += avgDy;
+          }
+        }
+        // Tier 3 (oldest webs beyond T1+T2): frozen — no update
+      }
+
+      // ─── Rendering ────────────────────────────────────────────
+      const CONNECTIONS = [
+        [0, 1],
+        [1, 2],
+        [2, 3],
+        [3, 4],
+        [0, 5],
+        [5, 6],
+        [6, 7],
+        [7, 8],
+        [5, 9],
+        [9, 10],
+        [10, 11],
+        [11, 12],
+        [9, 13],
+        [13, 14],
+        [14, 15],
+        [15, 16],
+        [13, 17],
+        [17, 18],
+        [18, 19],
+        [19, 20],
+        [0, 17],
+      ];
+
+      function drawSkeleton(pts, alpha) {
+        ctx.strokeStyle = `rgba(180,180,210,${alpha * 0.35})`;
+        ctx.lineWidth = 2;
+        ctx.lineCap = "round";
+        for (const [a, b] of CONNECTIONS) {
+          ctx.beginPath();
+          ctx.moveTo(pts[a].x, pts[a].y);
+          ctx.lineTo(pts[b].x, pts[b].y);
+          ctx.stroke();
+        }
+        ctx.fillStyle = `rgba(220,220,255,${alpha * 0.5})`;
+        for (const p of pts) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      function renderWebShot(shot) {
+        const a = shot.fadeAlpha;
+
+        // ── update physics ──
+        if (shot.state === "flying") {
+          shot.x += shot.vx;
+          shot.y += shot.vy;
+          shot.age++;
+          shot.trail.push({ x: shot.x, y: shot.y });
+          if (shot.trail.length > TRAIL_MAX) shot.trail.shift();
+          shot.splatR = Math.min(shot.splatMaxR, 4 + shot.age * 0.3);
+
+          // reached target anchor → stick
+          const toTarget = Math.hypot(
+            shot.targetX - shot.x,
+            shot.targetY - shot.y,
+          );
+          if (toTarget < SHOT_SPEED * 1.5) {
+            shot.x = shot.targetX;
+            shot.y = shot.targetY;
+            shot.state = "stuck";
+            shot.stuck = true;
+            shot.needsPatch = true; // trigger patch capture for optical flow
+          }
+
+          // off-screen or too old → fade
+          const off =
+            shot.x < -40 ||
+            shot.x > canvas.width + 40 ||
+            shot.y < -40 ||
+            shot.y > canvas.height + 40;
+          if (off || shot.age > SHOT_MAX_AGE) shot.state = "fading";
+        } else if (shot.state === "stuck") {
+          shot.age++;
+        } else if (shot.state === "dispersing") {
+          // Web was wiped by hand — burst outward and fade quickly
+          shot.disperseT = Math.min(1, shot.disperseT + DISPERSE_FADE);
+          shot.fadeAlpha -= DISPERSE_FADE;
+        }
+
+        // ── draw trail ──
+        if (shot.trail.length >= 2) {
+          // outer glow
+          ctx.strokeStyle = `rgba(111,111,255,${a * 0.08})`;
+          ctx.lineWidth = 28;
+          ctx.lineCap = "round";
+          ctx.lineJoin = "round";
+          ctx.beginPath();
+          ctx.moveTo(shot.trail[0].x, shot.trail[0].y);
+          for (let i = 1; i < shot.trail.length; i++)
+            ctx.lineTo(shot.trail[i].x, shot.trail[i].y);
+          ctx.stroke();
+
+          // mid glow
+          ctx.strokeStyle = `rgba(150,170,255,${a * 0.14})`;
+          ctx.lineWidth = 18;
+          ctx.beginPath();
+          ctx.moveTo(shot.trail[0].x, shot.trail[0].y);
+          for (let i = 1; i < shot.trail.length; i++)
+            ctx.lineTo(shot.trail[i].x, shot.trail[i].y);
+          ctx.stroke();
+
+          // crisp core — taper toward the tail
+          for (let i = 1; i < shot.trail.length; i++) {
+            const segAlpha = (i / shot.trail.length) * a * 0.92;
+            ctx.strokeStyle = `rgba(240,248,255,${segAlpha})`;
+            ctx.lineWidth = 4 + (i / shot.trail.length) * 5;
+            ctx.beginPath();
+            ctx.moveTo(shot.trail[i - 1].x, shot.trail[i - 1].y);
+            ctx.lineTo(shot.trail[i].x, shot.trail[i].y);
+            ctx.stroke();
+          }
+        }
+
+        // ── leading-edge web splat ──
+        const r = shot.splatR;
+        const stuckBoost = shot.stuck ? 1.4 : 1;
+
+        // outer glow
+        ctx.fillStyle = `rgba(111,111,255,${a * 0.1})`;
+        ctx.beginPath();
+        ctx.arc(shot.x, shot.y, (r + 14) * stuckBoost, 0, Math.PI * 2);
+        ctx.fill();
+
+        // mid glow
+        ctx.fillStyle = `rgba(150,170,255,${a * 0.18})`;
+        ctx.beginPath();
+        ctx.arc(shot.x, shot.y, (r + 10) * stuckBoost, 0, Math.PI * 2);
+        ctx.fill();
+
+        // core dot
+        ctx.fillStyle = `rgba(240,248,255,${a * 0.9})`;
+        ctx.beginPath();
+        ctx.arc(shot.x, shot.y, r * 0.6 * stuckBoost, 0, Math.PI * 2);
+        ctx.fill();
+
+        // radiating strands
+        ctx.strokeStyle = `rgba(240,248,255,${a * 0.7})`;
+        ctx.lineWidth = 3.5;
+        ctx.lineCap = "round";
+        for (let i = 0; i < SPLAT_STRANDS; i++) {
+          const ang = (Math.PI * 2 * i) / SPLAT_STRANDS + shot.age * 0.04;
+          const r2 =
+            r * stuckBoost * (0.7 + 0.3 * Math.sin(shot.age * 0.15 + i));
+          ctx.beginPath();
+          ctx.moveTo(shot.x, shot.y);
+          ctx.lineTo(shot.x + Math.cos(ang) * r2, shot.y + Math.sin(ang) * r2);
+          ctx.stroke();
+        }
+
+        // spider web net pattern (grows when stuck) — uses per-shot random geometry
+        if (shot.stuck) {
+          shot.netGrowth = Math.min(1, shot.netGrowth + NET_GROW_SPEED);
+          const easeOut = (t) => 1 - Math.pow(1 - t, 3);
+          const g = easeOut(shot.netGrowth);
+          const burstScale =
+            shot.state === "dispersing"
+              ? 1 + shot.disperseT * DISPERSE_BURST
+              : 1;
+          const spokes = shot.spokes;
+          const rings = shot.rings;
+
+          // helper: point along a wavy spoke at a given fraction of its length
+          const spokePoint = (spoke, frac) => {
+            const reach =
+              shot.netMaxR * burstScale * spoke.lengthMul * g * frac;
+            // perpendicular wobble makes the strand bow outward like silk
+            const wx = Math.cos(spoke.angle + Math.PI / 2);
+            const wy = Math.sin(spoke.angle + Math.PI / 2);
+            const bow =
+              Math.sin(frac * Math.PI + spoke.wobble) * spoke.wobbleAmp;
+            return {
+              x: shot.x + Math.cos(spoke.angle) * reach + wx * bow,
+              y: shot.y + Math.sin(spoke.angle) * reach + wy * bow,
+            };
+          };
+
+          // ── glow pass: radial spokes (wavy) ──
+          ctx.strokeStyle = `rgba(111,111,255,${a * 0.06})`;
+          ctx.lineWidth = 7;
+          ctx.lineCap = "round";
+          for (const s of spokes) {
+            const end = spokePoint(s, 1);
+            ctx.beginPath();
+            ctx.moveTo(shot.x, shot.y);
+            // quadratic curve through a mid-wobble point for a natural web sag
+            const mid = spokePoint(s, 0.5);
+            ctx.quadraticCurveTo(mid.x, mid.y, end.x, end.y);
+            ctx.stroke();
+          }
+
+          // ── crisp spokes (wavy) ──
+          ctx.strokeStyle = `rgba(240,248,255,${a * 0.5})`;
+          ctx.lineWidth = 1.5;
+          for (const s of spokes) {
+            const end = spokePoint(s, 1);
+            const mid = spokePoint(s, 0.5);
+            ctx.beginPath();
+            ctx.moveTo(shot.x, shot.y);
+            ctx.quadraticCurveTo(mid.x, mid.y, end.x, end.y);
+            ctx.stroke();
+          }
+
+          // ── concentric mesh rings (irregular radii + wobble) ──
+          for (let ri = 0; ri < rings.length; ri++) {
+            const ring = rings[ri];
+            const ringR = ring.radiusMul * g;
+            if (ringR < 0.04) continue;
+
+            const ringAlpha = a * (0.45 - ri * 0.04);
+            ctx.strokeStyle = `rgba(220,235,255,${ringAlpha})`;
+            ctx.lineWidth = 1.3;
+            ctx.lineCap = "round";
+            ctx.lineJoin = "round";
+
+            ctx.beginPath();
+            for (let i = 0; i < spokes.length; i++) {
+              const pt = spokePoint(spokes[i], ringR);
+              if (i === 0) ctx.moveTo(pt.x, pt.y);
+              else ctx.lineTo(pt.x, pt.y);
+            }
+            ctx.closePath();
+            ctx.stroke();
+
+            // organic zigzag connectors between this ring and the next
+            if (ri < rings.length - 1) {
+              const nextRing = rings[ri + 1];
+              const nextR = nextRing.radiusMul * g;
+              if (nextR - ringR < 0.04) continue;
+              const midR = (ringR + nextR) / 2;
+              ctx.strokeStyle = `rgba(200,220,255,${ringAlpha * 0.45})`;
+              ctx.lineWidth = 0.9;
+              for (let i = 0; i < spokes.length; i++) {
+                const s1 = spokes[i];
+                const s2 = spokes[(i + 1) % spokes.length];
+                const p1 = spokePoint(s1, ringR);
+                const p2 = spokePoint(s2, ringR);
+                const midAng = (s1.angle + s2.angle) / 2;
+                // add subtle per-gap randomness with the ring wobble phase
+                const jitter = Math.sin(ring.wobblePhase + i * 1.7) * 4;
+                const mx =
+                  shot.x +
+                  Math.cos(midAng) * (shot.netMaxR * burstScale * midR * 0.9) +
+                  jitter;
+                const my =
+                  shot.y +
+                  Math.sin(midAng) * (shot.netMaxR * burstScale * midR * 0.9) +
+                  jitter;
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.quadraticCurveTo(mx, my, p2.x, p2.y);
+                ctx.stroke();
+              }
+            }
+          }
+        }
+
+        // stuck webs linger, then fade (lifespan is dynamic — see updateOpticalFlow)
+        if (shot.state === "stuck" && shot.age > currentStuckMaxAge) {
+          shot.state = "fading";
+        }
+
+        // ── fade ──
+        if (shot.state === "fading") {
+          shot.fadeAlpha -= FADE_RATE;
+        }
+      }
+
+      // ─── Gesture → web logic (per hand) ───────────────────────
+      function updateGesture(lm, pts, hs) {
+        const sig = fingerStates(lm).join("");
+        const wristPx = pts[0];
+
+        if (sig === TARGET_GESTURE) {
+          hs.streak = Math.min(hs.streak + 1, 99);
+          if (hs.streak >= STREAK_REQUIRED) hs.active = true;
+        } else {
+          hs.streak = 0;
+          hs.active = false;
+          hs.hasFired = false; // reset — ready to fire again next time
+        }
+
+        // fire once per gesture hold — find contrast anchor in the scene
+        if (hs.active && !hs.hasFired) {
+          const anchor = findContrastAnchor(lm);
+          WEBS.push(createWebShot(wristPx, anchor));
+          hs.hasFired = true;
+        }
+      }
+
+      // ─── MediaPipe init ───────────────────────────────────────
+      async function initHandLandmarker() {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm",
+        );
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+            delegate: "GPU",
+          },
+          runningMode: "VIDEO",
+          numHands: 2,
+          minHandDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5,
+        });
+      }
+
+      // Silence the APIs optional analytics endpoint
+      // It's non-functional telemetry; when blocked it logs ERR_ABORTED.
+      {
+        const _fetch = window.fetch;
+        window.fetch = (input, init) => {
+          const url = typeof input === "string" ? input : input?.url;
+          if (url && url.includes("odml.pa.googleapis.com")) {
+            return Promise.resolve(new Response("", { status: 204 }));
+          }
+          return _fetch.call(window, input, init);
+        };
+      }
+
+      // ─── Camera init ──────────────────────────────────────────
+      async function initCamera() {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: CAM_WIDTH },
+            height: { ideal: CAM_HEIGHT },
+            facingMode: FACING_MODE,
+          },
+          audio: false,
+        });
+        video.srcObject = stream;
+        await new Promise((r) => (video.onloadedmetadata = r));
+        await video.play();
+        // Size the canvas to the visible (cover-cropped) region so the overlay
+        // aligns 1:1 with the displayed video.
+        recomputeCrop();
+      }
+
+      // ─── Main loop ────────────────────────────────────────────
+      function loop() {
+        if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+          lastVideoTime = video.currentTime;
+          const res = handLandmarker.detectForVideo(video, performance.now());
+
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+          if (res.landmarks && res.landmarks.length > 0) {
+            const seenKeys = new Set();
+
+            for (let hi = 0; hi < res.landmarks.length; hi++) {
+              const lm = res.landmarks[hi];
+              const pts = lm.map(toPx);
+
+              // Determine hand identity from handedness result
+              const handedness = res.handedness?.[hi]?.[0]?.categoryName;
+              const handKey = handedness || `hand${hi}`;
+              seenKeys.add(handKey);
+              const hs = getHandState(handedness, `hand${hi}`);
+
+              updateGesture(lm, pts, hs);
+              drawSkeleton(pts, hs.active ? 0.9 : 0.4);
+
+              if (hs.active) {
+                const f = pts[0];
+                const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 180);
+                ctx.fillStyle = `rgba(111,111,255,${0.15 + pulse * 0.15})`;
+                ctx.beginPath();
+                ctx.arc(f.x, f.y, 14 + pulse * 5, 0, Math.PI * 2);
+                ctx.fill();
+              }
+
+              // Web erasure by waving — fast hand movement through stuck webs
+              const palmX = pts[9].x;
+              const palmY = pts[9].y;
+              const palmSize = Math.hypot(
+                pts[0].x - pts[9].x,
+                pts[0].y - pts[9].y,
+              );
+              if (hs.prevPalmX !== null && palmSize > 5) {
+                const vel = Math.hypot(
+                  palmX - hs.prevPalmX,
+                  palmY - hs.prevPalmY,
+                );
+                if (vel > palmSize * ERASE_VEL_MULT) {
+                  for (const shot of WEBS) {
+                    if (shot.state === "stuck") {
+                      const webR =
+                        shot.netMaxR * Math.max(0.3, shot.netGrowth) * 1.3;
+                      if (Math.hypot(palmX - shot.x, palmY - shot.y) < webR) {
+                        shot.state = "dispersing";
+                        shot.disperseT = 0;
+                      }
+                    }
+                  }
+                }
+              }
+              hs.prevPalmX = palmX;
+              hs.prevPalmY = palmY;
+            }
+
+            // update optical flow for stuck webs (tiered LK tracking)
+            updateOpticalFlow();
+
+            // draw web projectiles
+            for (const shot of WEBS) renderWebShot(shot);
+
+            // cleanup dead shots
+            for (let i = WEBS.length - 1; i >= 0; i--) {
+              if (WEBS[i].fadeAlpha <= 0) WEBS.splice(i, 1);
+            }
+
+            // reset state for hands not detected this frame
+            resetStaleHands(seenKeys);
+          } else {
+            // no hands — let remaining webs finish their flight
+            resetStaleHands(new Set());
+            updateOpticalFlow();
+            for (const shot of WEBS) renderWebShot(shot);
+            for (let i = WEBS.length - 1; i >= 0; i--) {
+              if (WEBS[i].fadeAlpha <= 0) WEBS.splice(i, 1);
+            }
+          }
+        }
+        requestAnimationFrame(loop);
+      }
+
+      // ─── Boot ─────────────────────────────────────────────────
+      (async () => {
+        try {
+          await initHandLandmarker();
+          await initCamera();
+          loop();
+        } catch (err) {
+          console.error(err);
+        }
+      })();
+    </script>
+  </body>
+</html>
