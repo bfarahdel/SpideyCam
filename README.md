@@ -6,7 +6,7 @@ An AR app that turns your hand into Spider-Man's web shooter.
 
 The app is hosted via GitHub Pages:
 
-**<https://bfarahdel.github.io/SpideyCam/App/index.html>**
+**<https://bfarahdel.github.io/SpideyCam/index.html>**
 
 ## Instructions
 

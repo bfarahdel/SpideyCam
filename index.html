@@ -70,6 +70,60 @@
         height: 100%;
         pointer-events: none;
       }
+      #loader {
+        position: fixed;
+        inset: 0;
+        background: #0a0a0f;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 10;
+        transition: opacity 0.4s ease;
+      }
+      #loader.hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #loader .bar {
+        width: min(260px, 60vw);
+        height: 4px;
+        background: rgba(255, 255, 255, 0.08);
+        border-radius: 999px;
+        overflow: hidden;
+        position: relative;
+      }
+      #loader .fill {
+        position: absolute;
+        top: 0;
+        left: 0;
+        height: 100%;
+        width: 45%;
+        background: linear-gradient(90deg, #6f6fff, #27d2bf);
+        border-radius: 999px;
+        animation: loadslide 1s ease-in-out infinite;
+      }
+      #loader .complete {
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(90deg, #6f6fff, #27d2bf);
+        border-radius: 999px;
+        opacity: 0;
+        transition: opacity 0.18s ease;
+      }
+      #loader.done .fill {
+        animation: none;
+      }
+      #loader.done .complete {
+        opacity: 1;
+      }
+      @keyframes loadslide {
+        0% {
+          transform: translateX(-110%);
+        }
+        100% {
+          transform: translateX(322%);
+        }
+      }
 
       /* Mobile: full-screen, no card, no gaps */
       @media (max-width: 768px) and (pointer: coarse) {
@@ -89,6 +143,12 @@
     </style>
   </head>
   <body>
+    <div id="loader">
+      <div class="bar" role="progressbar">
+        <div class="fill"></div>
+        <div class="complete"></div>
+      </div>
+    </div>
     <div id="stage">
       <video id="cam" autoplay playsinline muted></video>
       <canvas id="fx"></canvas>
@@ -976,13 +1036,25 @@
       }
 
       // ─── Boot ─────────────────────────────────────────────────
+      function hideLoader() {
+        const loader = document.getElementById("loader");
+        if (!loader) return;
+        loader.classList.add("done"); // fill bar to full before revealing
+        setTimeout(() => {
+          loader.classList.add("hidden");
+          setTimeout(() => loader.remove(), 500);
+        }, 220);
+      }
+
       (async () => {
         try {
           await initHandLandmarker();
           await initCamera();
+          hideLoader();
           loop();
         } catch (err) {
           console.error(err);
+          hideLoader();
         }
       })();
     </script>
