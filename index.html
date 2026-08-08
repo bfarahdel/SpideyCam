@@ -910,7 +910,7 @@
             delegate: "GPU",
           },
           runningMode: "VIDEO",
-          numHands: 2,
+          numHands: IS_MOBILE ? 1 : 2,
           minHandDetectionConfidence: 0.5,
           minTrackingConfidence: 0.5,
         });
