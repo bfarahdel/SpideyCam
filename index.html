@@ -70,6 +70,26 @@
         height: 100%;
         pointer-events: none;
       }
+      #watermark {
+        position: absolute;
+        top: 14px;
+        right: 16px;
+        z-index: 2;
+        font-family:
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: rgba(255, 255, 255, 0.72);
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+        pointer-events: none;
+        user-select: none;
+        -webkit-user-select: none;
+      }
       #loader {
         position: fixed;
         inset: 0;
@@ -139,17 +159,23 @@
           border-radius: 0;
           box-shadow: none;
         }
+        #watermark {
+          font-size: 11px;
+          top: 10px;
+          right: 12px;
+        }
       }
     </style>
   </head>
   <body>
     <div id="loader">
-      <div class="bar" role="progressbar">
+      <div class="bar">
         <div class="fill"></div>
         <div class="complete"></div>
       </div>
     </div>
     <div id="stage">
+      <div id="watermark">SpideyCam@Britny</div>
       <video id="cam" autoplay playsinline muted></video>
       <canvas id="fx"></canvas>
     </div>
