@@ -206,6 +206,104 @@
       const DISPERSE_FADE = 0.08; // fade rate for dispersed webs (~0.2s at 60fps)
       const DISPERSE_BURST = 0.6; // net expands by this fraction as it disperses
 
+      // ─── Sound effects (procedural Web Audio; hybrid-ready) ──
+      // thwip()/splat() for Audio() clips later without
+      // touching call sites.
+      const SFX_VOLUME = 1.0;
+      const SFX_BOOST = 3.0; // master gain boost (unity = 1.0); compressor catches peaks
+      const sfx = {
+        ctx: null,
+        master: null,
+        ensure() {
+          if (!this.ctx) {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+            // Master boost chain: gain → compressor → destination
+            // Increases the sound volume
+            this.master = this.ctx.createGain();
+            this.master.gain.value = SFX_BOOST;
+            const comp = this.ctx.createDynamicsCompressor();
+            comp.threshold.value = -10;
+            comp.knee.value = 6;
+            comp.ratio.value = 4;
+            comp.attack.value = 0.003;
+            comp.release.value = 0.1;
+            this.master.connect(comp).connect(this.ctx.destination);
+          }
+          if (this.ctx.state === "suspended") this.ctx.resume();
+          return this.ctx;
+        },
+        // "Thwip": rapid descending noise + rising bandpass noise
+        thwip() {
+          const ctx = this.ensure();
+          const now = ctx.currentTime;
+          const THWIP_GAIN = 3.0; // extra boost
+
+          // Descending noise
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = "sawtooth";
+          osc.frequency.setValueAtTime(2600, now);
+          osc.frequency.exponentialRampToValueAtTime(450, now + 0.1);
+          gain.gain.setValueAtTime(SFX_VOLUME * THWIP_GAIN, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+          osc.connect(gain).connect(this.master);
+          osc.start(now);
+          osc.stop(now + 0.13);
+
+          // Rising noise for web shooting
+          const zipDur = 0.1;
+          const zipBuf = ctx.createBuffer(
+            1,
+            Math.floor(ctx.sampleRate * zipDur),
+            ctx.sampleRate,
+          );
+          const zipData = zipBuf.getChannelData(0);
+          for (let i = 0; i < zipData.length; i++) {
+            zipData[i] = Math.random() * 2 - 1;
+          }
+          const zip = ctx.createBufferSource();
+          zip.buffer = zipBuf;
+          const zipFilter = ctx.createBiquadFilter();
+          zipFilter.type = "bandpass";
+          zipFilter.frequency.setValueAtTime(600, now);
+          zipFilter.frequency.exponentialRampToValueAtTime(3500, now + zipDur);
+          zipFilter.Q.value = 2.5;
+          const zipGain = ctx.createGain();
+          zipGain.gain.setValueAtTime(SFX_VOLUME * THWIP_GAIN * 0.8, now);
+          zipGain.gain.exponentialRampToValueAtTime(0.0001, now + zipDur);
+          zip.connect(zipFilter).connect(zipGain).connect(this.master);
+          zip.start(now);
+          zip.stop(now + zipDur);
+        },
+        // Sticky "splat" noise
+        splat() {
+          const ctx = this.ensure();
+          const now = ctx.currentTime;
+          const dur = 0.15;
+          const buffer = ctx.createBuffer(
+            1,
+            Math.floor(ctx.sampleRate * dur),
+            ctx.sampleRate,
+          );
+          const data = buffer.getChannelData(0);
+          for (let i = 0; i < data.length; i++) {
+            data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+          }
+          const noise = ctx.createBufferSource();
+          noise.buffer = buffer;
+          const filter = ctx.createBiquadFilter();
+          filter.type = "lowpass";
+          filter.frequency.setValueAtTime(900, now);
+          filter.frequency.exponentialRampToValueAtTime(300, now + dur);
+          const gain = ctx.createGain();
+          gain.gain.setValueAtTime(SFX_VOLUME, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+          noise.connect(filter).connect(gain).connect(this.master);
+          noise.start(now);
+          noise.stop(now + dur);
+        },
+      };
+
       // ─── DOM ──────────────────────────────────────────────────
       const video = document.getElementById("cam");
       // Disable CSS mirroring on mobile (rear camera shows true orientation)
@@ -229,7 +327,7 @@
       let lastVideoTime = -1;
       const WEBS = [];
 
-      // Per-hand state — keyed by handedness label ("Left"/"Right")
+      // Hand state ("Left"/"Right")
       // Falls back to index if handedness is missing
       const handState = {}; // { "Left": {streak, active, hasFired}, "Right": {...} }
 
@@ -280,10 +378,10 @@
         return [thumb, ext(8, 6), ext(12, 10), ext(16, 14), ext(20, 18)];
       }
 
-      // ─── Cover-crop: align overlay with the visible (object-fit: cover) video ──
-      // The <video> uses object-fit: cover, so it crops the full frame to fill the
+      // ─── Cover-crop: align overlay with the hand ──
+      // The <video> crops the full frame to fill the
       // stage. The canvas must represent that same cropped region, otherwise the
-      // skeleton/webs drift from the visible hand. Recomputed on init + resize.
+      // webs drift from the hand. Recomputed on init + resize.
       let cropX0 = 0,
         cropY0 = 0,
         cropW = 1,
@@ -334,6 +432,7 @@
 
       // ─── Web projectile lifecycle ─────────────────────────────
       function createWebShot(originPx, anchorPx) {
+        sfx.thwip();
         const dx = anchorPx.x - originPx.x;
         const dy = anchorPx.y - originPx.y;
         const dist = Math.hypot(dx, dy) || 1;
@@ -553,8 +652,7 @@
 
         for (const web of tier1) {
           // Capture initial patch on first tracking frame.
-          // Skip LK this frame: a single patch yields no displacement, and
-          // comparing it to itself would report zero texture-relative motion.
+          // Skip LK on this frame because there is no displacement.
           if (web.needsPatch) {
             const vp = canvasToVideo(web.x, web.y);
             web.patch = extractPatch(vp.x, vp.y);
@@ -582,7 +680,7 @@
             tracked++;
           } else {
             // Low confidence: freeze the web (no position update). Only fade if
-            // we previously had tracking and it stays lost past the grace period
+            // the previous tracking stays lost past the grace period
             // — a textureless surface (hadTrack=false) just stays put and lets
             // the age-based expiry handle it, so webs on blank walls still linger.
             web.trackConfidence = 0;
@@ -671,6 +769,7 @@
             shot.state = "stuck";
             shot.stuck = true;
             shot.needsPatch = true; // trigger patch capture for optical flow
+            sfx.splat();
           }
 
           // off-screen or too old → fade
